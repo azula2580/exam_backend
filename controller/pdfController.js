@@ -52,7 +52,7 @@ function buildPrompt(text, questionCount) {
   return `Дараах текстийг уншаад яг ${questionCount} олон сонголттой тест асуулт үүсгэ.
 
 ТЕКСТ:
-${text.slice(0, 6000)}
+${text.slice(0, 3000)}
 
 ЗААВАЛ дагах дүрэм:
 - Яг ${questionCount} асуулт үүсгэнэ
@@ -127,7 +127,7 @@ exports.generateFromPDF = async (req, res) => {
 
 exports.generateQuestionsOnly = async (req, res) => {
   try {
-    const questionCount = parseInt(req.body.questionCount) || 10
+    const questionCount = Math.min(parseInt(req.body.questionCount) || 10, 15)
     if (!req.file) return res.status(400).json({ success: false, message: 'PDF файл оруулна уу.' })
 
     let text
