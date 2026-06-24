@@ -21,154 +21,160 @@ async function extractTextFromPDF(buffer) {
   return text.trim()
 }
 
-// Нэг асуулт үүсгэх — JSON богино тул таслагдахгүй
-async function generateOneQuestion(text, index, total) {
-  const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate'
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 120000)
+async function callGroq(prompt) {
+  const apiKey = process.env.GROQ_API_KEY
+  if (!apiKey) throw new Error('GROQ_API_KEY тохируулаагүй байна.')
 
-  const prompt = `Read this text and create 1 multiple choice question.
-
-  TEXT: ${text.slice(0, 2000)}
-
-  You must respond with ONLY this exact JSON format:
-  {"text":"Write the full question here?","options":["First answer choice","Second answer choice","Third answer choice","Fourth answer choice"],"correctIndex":1,"topic":"Topic name"}
-
-  Important rules:
-  - "text" must be a proper question ending with "?"
-  - "options" must have exactly 4 DIFFERENT answer choices (not "option A", "option B")
-  - "correctIndex" is 0, 1, 2, or 3 (which option is correct)
-  - "topic" is the subject area
-  - Write everything in MONGOLIAN language
-  - This is question number ${index} of ${total}, make it different from other questions
-  - NO markdown, NO explanation, ONLY the JSON object`
-  try {
-    const response = await fetch(ollamaUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        model: process.env.OLLAMA_MODEL || 'llama3.2',
-        system: 'Respond with valid JSON only. No explanation, no markdown.',
-        prompt,
-        stream: false,
-        options: { temperature: 0.3, num_predict: 300, num_ctx: 2048 }
-      })
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: 'llama-3.1-8b-instant',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.7,
+      max_tokens: 4096,
     })
-    if (!response.ok) throw new Error(`Ollama алдаа: ${response.status}`)
-    const data = await response.json()
-    const raw = data.response?.trim() || ''
+  })
 
-    // JSON задлах
-    const start = raw.indexOf('{')
-    const end = raw.lastIndexOf('}')
-    if (start === -1 || end === -1) throw new Error('JSON олдсонгүй')
-    const q = JSON.parse(raw.slice(start, end + 1))
-    if (!q.text || !Array.isArray(q.options) || q.options.length !== 4) {
-      throw new Error('хариулт буруу форматтай байна')
-    }
-    return q
-  } finally {
-    clearTimeout(timeout)
+  if (!response.ok) {
+    const err = await response.text()
+    throw new Error(`Groq алдаа: ${response.status} - ${err}`)
   }
+
+  const data = await response.json()
+  return data.choices[0].message.content
+}
+
+function buildPrompt(text, questionCount) {
+  return `Дараах текстийг уншаад яг ${questionCount} олон сонголттой тест асуулт үүсгэ.
+
+ТЕКСТ:
+${text.slice(0, 6000)}
+
+ЗААВАЛ дагах дүрэм:
+- Яг ${questionCount} асуулт үүсгэнэ
+- Бүх асуулт, хариулт МОНГОЛ хэлээр байна
+- Хариулт 4 сонголттой
+- Зөвхөн текстэд суурилна
+- Зөвхөн JSON буцаа
+
+JSON формат:
+{
+  "questions": [
+    {
+      "text": "Асуултын текст",
+      "options": ["А сонголт", "Б сонголт", "В сонголт", "Г сонголт"],
+      "correctIndex": 0,
+      "topic": "Сэдэв"
+    }
+  ]
+}
+
+Зөвхөн JSON буцаа, өөр юм бичихгүй:`
+}
+
+function parseResponse(raw) {
+  let cleaned = raw.trim()
+  const jsonMatch = cleaned.match(/\{[\s\S]*"questions"[\s\S]*\}/)
+  if (jsonMatch) cleaned = jsonMatch[0]
+  cleaned = cleaned.replace(/```json|```/g, '').trim()
+  return JSON.parse(cleaned)
 }
 
 exports.generateFromPDF = async (req, res) => {
   try {
-    const { examId, questionCount = 5 } = req.body
+    const { examId, questionCount = 10 } = req.body
     const exam = await Exam.findById(examId)
     if (!exam) return res.status(404).json({ success: false, message: 'Шалгалт олдсонгүй.' })
     if (exam.createdBy.toString() !== req.user._id.toString() && req.user.role !== 'admin')
       return res.status(403).json({ success: false, message: 'Эрхгүй.' })
     if (!req.file) return res.status(400).json({ success: false, message: 'PDF файл оруулна уу.' })
 
-    console.log('[PDF] File received:', req.file.originalname, req.file.size, 'bytes')
     let text
-    try { text = await extractTextFromPDF(req.file.buffer) }
-    catch (e) { return res.status(400).json({ success: false, message: 'PDF файлыг унших боломжгүй.' }) }
-    console.log('[PDF] Extracted text length:', text?.length || 0)
-    if (!text || text.length < 50)
-      return res.status(400).json({ success: false, message: 'PDF-ийн агуулга хэтэрхий богино байна.' })
-
-    const count = Math.min(parseInt(questionCount) || 5, 10)
-    const questions = []
-    for (let i = 1; i <= count; i++) {
-      console.log(`[PDF] Асуулт ${i}/${count} үүсгэж байна...`)
-      try {
-        const q = await generateOneQuestion(text, i, count)
-        questions.push(q)
-      } catch (e) {
-        console.warn(`[PDF] Асуулт ${i} алдаа:`, e.message)
-      }
+    try {
+      text = await extractTextFromPDF(req.file.buffer)
+    } catch (err) {
+      return res.status(400).json({ success: false, message: 'PDF унших боломжгүй.' })
     }
 
-    if (!questions.length)
+    if (!text || text.length < 50)
+      return res.status(400).json({ success: false, message: 'PDF агуулга хэтэрхий богино байна.' })
+
+    const raw = await callGroq(buildPrompt(text, questionCount))
+    let parsed
+    try { parsed = parseResponse(raw) }
+    catch { return res.status(500).json({ success: false, message: 'AI хариултыг задлахад алдаа гарлаа.' }) }
+
+    if (!parsed.questions?.length)
       return res.status(500).json({ success: false, message: 'Асуулт үүсгэхэд алдаа гарлаа.' })
 
     const existing = await Question.countDocuments({ exam: examId })
-    const saved = await Question.insertMany(questions.map((q, i) => ({
+    const toInsert = parsed.questions.map((q, i) => ({
       exam: examId, text: q.text, options: q.options,
-      correctIndex: Number(q.correctIndex), topic: q.topic || '', order: existing + i + 1,
-    })))
+      correctIndex: Number(q.correctIndex), topic: q.topic || '',
+      order: existing + i + 1,
+    }))
+    const saved = await Question.insertMany(toInsert)
+    res.status(201).json({ success: true, message: `${saved.length} асуулт үүсгэгдлээ.`, count: saved.length, data: saved })
 
-    res.status(201).json({
-      success: true,
-      message: `${saved.length} асуулт амжилттай үүсгэгдлээ.`,
-      count: saved.length, data: saved,
-    })
   } catch (err) {
-    console.error('[PDF] Generate error:', err)
     res.status(500).json({ success: false, message: err.message })
   }
 }
 
 exports.generateQuestionsOnly = async (req, res) => {
   try {
-    const questionCount = Math.min(parseInt(req.body.questionCount) || 5, 10)
+    const questionCount = parseInt(req.body.questionCount) || 10
     if (!req.file) return res.status(400).json({ success: false, message: 'PDF файл оруулна уу.' })
 
-    console.log('[PDF] File received:', req.file.originalname, req.file.size, 'bytes')
     let text
-    try { text = await extractTextFromPDF(req.file.buffer) }
-    catch (e) { return res.status(400).json({ success: false, message: 'PDF файлыг унших боломжгүй.' }) }
-    console.log('[PDF] Extracted text length:', text?.length || 0)
-    if (!text || text.length < 50)
-      return res.status(400).json({ success: false, message: 'PDF-ийн агуулга хэтэрхий богино байна.' })
-
-    const questions = []
-    for (let i = 1; i <= questionCount; i++) {
-      console.log(`[PDF] Асуулт ${i}/${questionCount} үүсгэж байна...`)
-      try {
-        const q = await generateOneQuestion(text, i, questionCount)
-        questions.push(q)
-      } catch (e) {
-        console.warn(`[PDF] Асуулт ${i} алдаа:`, e.message)
-      }
+    try {
+      text = await extractTextFromPDF(req.file.buffer)
+    } catch (err) {
+      return res.status(400).json({ success: false, message: 'PDF унших боломжгүй.' })
     }
 
-    if (!questions.length)
+    if (!text || text.length < 50)
+      return res.status(400).json({ success: false, message: 'PDF агуулга хэтэрхий богино байна.' })
+
+    const raw = await callGroq(buildPrompt(text, questionCount))
+    let parsed
+    try { parsed = parseResponse(raw) }
+    catch { return res.status(500).json({ success: false, message: 'AI хариултыг задлахад алдаа гарлаа.' }) }
+
+    if (!parsed.questions?.length)
       return res.status(500).json({ success: false, message: 'Асуулт үүсгэхэд алдаа гарлаа.' })
 
     res.status(200).json({
       success: true,
-      message: `${questions.length} асуулт амжилттай үүсгэгдлээ.`,
-      questions,
+      message: `${parsed.questions.length} асуулт үүсгэгдлээ.`,
+      questions: parsed.questions,
     })
+
   } catch (err) {
-    console.error('[PDF] Generate error:', err)
     res.status(500).json({ success: false, message: err.message })
   }
 }
-
 exports.checkOllamaConnection = async (req, res) => {
   try {
-    const baseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
-    const response = await fetch(`${baseUrl}/api/tags`)
-    if (!response.ok) throw new Error('Ollama холбогдоогүй')
+    const apiKey = process.env.GROQ_API_KEY
+    if (!apiKey) throw new Error('GROQ_API_KEY тохируулаагүй.')
+
+    const response = await fetch('https://api.groq.com/openai/v1/models', {
+      headers: { 'Authorization': `Bearer ${apiKey}` }
+    })
+    if (!response.ok) throw new Error('Groq холбогдоогүй')
     const data = await response.json()
-    const models = data.models?.map(m => m.name) || []
-    res.json({ success: true, connected: true, message: 'Ollama холбогдсон', models, model: process.env.OLLAMA_MODEL || 'llama3.2' })
+    res.json({
+      success: true, connected: true,
+      message: 'Groq AI холбогдсон',
+      model: 'llama-3.1-8b-instant',
+      models: data.data?.map(m => m.id) || []
+    })
   } catch (err) {
-    res.status(500).json({ success: false, connected: false, message: 'Ollama сервер ажиллахгүй байна.', error: err.message })
+    res.status(500).json({ success: false, connected: false, message: err.message })
   }
 }
